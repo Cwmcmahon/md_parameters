@@ -1,0 +1,130 @@
+---
+title: "Your Historical Weather Summary"
+format: 
+  docx:
+    fig-dpi: 300
+params:
+  city: "Portland, Seattle, Los Angeles, San Francisco"
+  year: 2022
+execute: 
+  warning: false
+  message: false
+  echo: false
+---
+
+```{r setup}
+#| include: false
+library(tidyverse)
+library(magrittr)
+library(httr)
+library(jsonlite)
+library(flextable)
+```
+
+```{r City info}
+city_vec <- params$city %>% 
+  str_split_1(", ") %>%
+  str_replace_all(" ", "_")
+
+for (city in city_vec) {
+  city_json <- GET(url = paste0("https://geocoding-api.open-meteo.com/v1/search?name=", 
+                                city %>% str_replace_all("_", "%20"), 
+                                "&count=1"))
+  
+  city_coords <- city_json %>% 
+  content(as = "parsed") %>% 
+  as.data.frame() %>% 
+  flatten() %>% 
+  select(name = results.name, 
+         lat = results.latitude, 
+         lng = results.longitude,
+         ele = results.elevation)
+  
+  assign(x = tolower(paste0(city, "_coords")), value = city_coords)
+}
+```
+
+```{r Daily data}
+daily_weather_df <- data.frame()
+
+for (city in city_vec) {
+  daily_weather_json <- GET(url = paste0("https://archive-api.open-meteo.com/v1/archive?latitude=", 
+                                         (as.name(paste0(tolower(city), "_coords")) %>% get())$lat[[1]],
+                                         "&longitude=", 
+                                         (as.name(paste0(tolower(city), "_coords")) %>% get())$lng[[1]], 
+                                         "&start_date=", params$year, "-01-01",
+                                         "&end_date=", params$year, "-12-31",
+                                         "&daily=temperature_2m_max,temperature_2m_min,temperature_2m_mean,precipitation_sum&timezone=America%2FLos_Angeles&temperature_unit=fahrenheit&precipitation_unit=inch"))
+  
+  daily_weather_parsed <- daily_weather_json %>% 
+    content(as = "parsed")
+  
+  city_weather_df <- data_frame(daily_weather_parsed$daily) %>% 
+    rename(nested = `daily_weather_parsed$daily`) %>% 
+    cbind(name = c("date", "max", "min", "mean", "precip")) %>% 
+    pivot_wider(values_from = nested) %>% 
+    unnest() %>% 
+    unnest() %>%
+    mutate(date = as.Date(date)) %>%
+    pivot_longer(max:mean, names_to = "temp_type", values_to = "temp") %>%
+    cbind(city = city)
+  
+  daily_weather_df %<>%
+    rbind(city_weather_df)
+}
+```
+
+`r params$year` weather trends for: `r params$city`
+
+```{r Table}
+#| tbl-id: 1
+#| tbl-cap: temp
+daily_weather_df %>%
+  mutate(City = str_replace_all(city, "_", " "), .keep = "unused") %>%
+  group_by(City) %>%
+  summarize(Max_Temp = max(temp),
+            Max_Date = date[which.max(temp)],
+            Min_Temp = min(temp),
+            Min_Date = date[which.min(temp)],
+            `Total Precipitation (in)` = sum(precip)) %>%
+  ungroup() %>%
+  flextable() %>%
+  set_header_labels(Max_Temp = "Temp (F)",
+                    Max_Date = "Date",
+                    Min_Temp = "Temp (F)",
+                    Min_Date = "Date") %>%
+  add_header_row(values = c("", "Maximum", "Minimum", ""),
+                 colwidths = c(1,2,2,1)) %>%
+  colformat_date(fmt_date = "%b %d") %>%
+  style(part = "header",
+        pr_p = officer::fp_par(text.align = "center")) %>%
+  autofit() %>%
+  set_caption("Summary of Temperatures and Precipitation")
+```
+
+```{r Plot}
+#| fig-width: 6.5
+daily_weather_df %>% 
+  filter(temp_type != "mean") %>%
+  mutate(city = str_replace_all(city, "_", " "),
+         city = factor(city, levels = str_split_1(params$city, ", "))) %>%
+  ggplot(aes(x = date, y = temp, color = temp_type)) +
+    geom_col(data = . %>% filter(temp_type == "min"), aes(y = precip * 18), fill = "grey40", color ="grey40", alpha = 0.2) +
+    geom_line() +
+    theme_minimal() +
+    scale_y_continuous(name = "Daily Temps (F)", 
+                       breaks = c(0, 20, 40, 60, 80, 100),
+                       sec.axis = sec_axis(~./18, 
+                                           name = "Precipitation (inches)",
+                                           breaks = c(0, 1, 2, 3))) +
+    scale_x_date(date_labels = "%b",
+                 date_breaks = "2 months") +
+    scale_color_manual(name = "Temp Measurements", 
+                       labels = c("Max", "Min"), 
+                       values = c("max" = "firebrick", 
+                                  "min" = "steelblue3")) +
+    facet_wrap(facets = ~city, nrow = 2, ncol = 2, drop = F) +
+    labs(title = "Daily Temperatures and Precipitation",
+         x = "Date") +
+    theme(panel.grid.minor = element_blank()) 
+```
